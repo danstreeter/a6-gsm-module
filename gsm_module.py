@@ -16,7 +16,6 @@ from time import sleep
 
 # Local Imports
 import config
-from functions import *
 
 
 def send_at_command(command, append_eol=True, encoding='iso8859_2'):
@@ -175,7 +174,7 @@ def load_phonebook_from_file(filename='contacts.json'):
         print(entry['id'])
 
 
-def watch_for_unbound():
+def watch_serial_port():
     print("Listening to port...")
     while True:
         received_data = port.read()              #read serial port
@@ -247,9 +246,13 @@ try:
     )
     channel.queue_declare(queue=config.RABBIT_QUEUE)
 
+    print("Checking for messages already received")
+    collect_and_push_to_rabbit(get_sms_messages())
+
     # load_phonebook_from_file()
     # send_sms_message("+447xxxxxxxxx", "Testing 123")
-    watch_for_unbound()
+    print("Watching serial for inbound messages")
+    watch_serial_port()
 
 except KeyboardInterrupt:
     print("Quitting...")
