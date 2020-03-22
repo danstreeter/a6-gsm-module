@@ -8,6 +8,7 @@ from datetime import (
 import json
 import pika
 import serial
+import threading
 from time import sleep
 
 # Framework / Library Imports
@@ -17,6 +18,7 @@ from time import sleep
 # Local Imports
 import config
 
+outbound_commands = []
 
 def send_at_command(command, append_eol=True, encoding='iso8859_2'):
     command = command + "\r\n" if append_eol else command
@@ -106,15 +108,19 @@ def delete_sms_message(index):
 
 def parse_sms(sms_meta, sms_text):
     sms_meta = sms_meta.split(',')
-
-    return {
-        'index': int(sms_meta[0].split(': ')[1]),
-        'category': sms_meta[1].split("\"")[1],
-        'sender': sms_meta[2].split("\"")[1],
-        'datetime': str(format_dtstr_to_obj(clean_datetime(sms_meta[4] + " " + sms_meta[5]))),
-        'timestamp': format_dtstr_to_obj(clean_datetime(sms_meta[4] + " " + sms_meta[5])).replace(tzinfo=timezone.utc).timestamp(),
-        'text': sms_text.rstrip()
-    }
+    try:
+        return {
+            'index': int(sms_meta[0].split(': ')[1]),
+            'category': sms_meta[1].split("\"")[1],
+            'sender': sms_meta[2].split("\"")[1],
+            'datetime': str(format_dtstr_to_obj(clean_datetime(sms_meta[4] + " " + sms_meta[5]))),
+            'timestamp': format_dtstr_to_obj(clean_datetime(sms_meta[4] + " " + sms_meta[5])).replace(tzinfo=timezone.utc).timestamp(),
+            'text': sms_text.rstrip()
+        }
+    except IndexError as ie:
+        print(str(ie))
+        print(sms_meta)
+        raise
 
 
 def clean_datetime(dt_string):
@@ -174,21 +180,54 @@ def load_phonebook_from_file(filename='contacts.json'):
         print(entry['id'])
 
 
-def watch_serial_port():
+def watch_serial_port(push_channel):
     print("Listening to port...")
     while True:
-        received_data = port.read()              #read serial port
-        sleep(0.03)
-        data_left = port.inWaiting()             #check for remaining byte
-        received_data += port.read(data_left)
-        if len(received_data) > 0:
-            line_data = received_data.decode("iso8859_2")
-            # print (line_data)    #print received data
+        if len(outbound_commands) > 0:
+            print('Outbound Command!')
+            command = outbound_commands.pop(0)
+            command()
+            sleep(0.03)
+        else:
+            # print('Within the listen loop')
+            received_data = port.read()              #read serial port
+            sleep(0.03)
+            data_left = port.inWaiting()             #check for remaining byte
+            received_data += port.read(data_left)
+            if len(received_data) > 0:
+                line_data = received_data.decode("iso8859_2")
+                print (line_data)    #print received data
 
-            if '+CIEV: "MESSAGE"' in line_data:
-                print("Inbound Message!")
-                collect_and_push_to_rabbit(get_sms_messages())
-        # port.write(received_data)                #transmit data serially 
+                if '+CIEV: "MESSAGE"' in line_data:
+                    print("Inbound Message!")
+                    collect_and_push_to_rabbit(push_channel, get_sms_messages())
+                # All this is commented out as it doesn't seem to expose itself
+                # on the python serial stream
+                # elif '+CREG: ' in line_data:
+                #     print("Network Update")
+                #     status_id = line_data[-1]
+                #     statuses = {
+                #         0: "NOT_REGISTERED_NOT_SEARCHING",
+                #         1: "REGISTERED_HOME",
+                #         2: "NOT_REGISTERED_SEARCHING",
+                #         3: "REGISTRATION_DENIED",
+                #         4: "UNKNOWN",
+                #         5: "REGISTERED_ROAM",
+                #         6: "REGISTERED_SMS_ONLY_HOME",
+                #         7: "REGISTERED_SMS_ONLY_ROAM",
+                #         8: "EMERGENCY_ONLY",
+                #         9: "CSFB_NOT_PREFERRED_HOME",
+                #         10: "CSFB_NOT_PREFERRED_ROAM"
+                #     }
+                #     if status_id not in statuses:
+                #         print("Status: " + str(status_id) + "NOT FOUND")
+                #     else:
+                #         print("Status: " + str(status_id) + ": " + statuses[status_id])
+                #         status = {
+                #             'status': statuses[status_id],
+                #             'timestamp': datetime.datetime.now().timestamp()
+                #         }
+                #         update_network_status(push_channel, status)
 
 
 def get_rabbit_connection(user, password, server):
@@ -207,14 +246,29 @@ def get_rabbit_connection(user, password, server):
     return connection.channel()
 
 
-def collect_and_push_to_rabbit(messages):
+# Commented out in line with +CREG not being on the serial stream
+# def update_network_status(push_channel, status):
+#         try:
+#             # print("Timestamp: " + str(message['timestamp']))
+#             # print(str(message))
+#             push_channel.basic_publish(
+#                 exchange='',
+#                 routing_key=config.RABBIT_QUEUE_PREFIX + "network_status",
+#                 body=json.dumps(status),
+#             )
+#         except Exception:
+#             print("There was a problem updating network status on the queue")
+
+
+
+def collect_and_push_to_rabbit(push_channel, messages):
     for message in messages:
         try:
             # print("Timestamp: " + str(message['timestamp']))
             # print(str(message))
-            channel.basic_publish(
+            push_channel.basic_publish(
                 exchange='',
-                routing_key=config.RABBIT_QUEUE,
+                routing_key=config.RABBIT_QUEUE_PREFIX + "inbound_sms",
                 body=json.dumps(message),
                 # properties=pika.BasicProperties(
                 #     content_type="application/json",
@@ -227,7 +281,32 @@ def collect_and_push_to_rabbit(messages):
             delete_sms_message(message['index'])
             print("Message handled and pushed to queue")
         except Exception:
-            print("There was a problem")
+            print("There was a problem pushing a message to the queue")
+
+####################################################
+####################################################
+# Rabbit Worker Stuff
+
+def on_message(channel, method_frame, header_frame, body):
+    queue_job_id = method_frame.delivery_tag
+    print('[QUEUE >>>>] Got a job to do: [%s]' % queue_job_id)
+
+    bodyDict = json.loads(body)
+    print(bodyDict)
+    if bodyDict['text'].lower() == "ping":
+        print('[JOB  >>>>] Ping Job Requested')
+        args = [bodyDict["sender"], "PONG"]
+        outbound_commands.append(lambda:send_sms_message(*args))
+
+    channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+
+def queue_handler(channel):
+    channel.basic_consume(config.RABBIT_QUEUE_PREFIX + "inbound_sms", on_message)
+    channel.start_consuming()
+    print("Consuming from the queue")
+
+####################################################
+
 
 try:
     port = serial.Serial(config.serial_port, config.baud_rate, timeout=2)
@@ -238,21 +317,37 @@ try:
     print('Initializing SIM')
     init(config.sim_card_pin)
 
-    print('Initializing RabbitMQ Connection')
-    channel = get_rabbit_connection(
+    print('Initializing RabbitMQ Push Connection')
+    push_channel = get_rabbit_connection(
         user = config.RABBIT_USER,
         password = config.RABBIT_PASS,
         server = config.RABBIT_SERVER
     )
-    channel.queue_declare(queue=config.RABBIT_QUEUE)
+    # Setup the queues
+    push_channel.queue_declare(queue=config.RABBIT_QUEUE_PREFIX + "inbound_sms")
+    # push_channel.queue_declare(queue=config.RABBIT_QUEUE_PREFIX + "network_status")
 
     print("Checking for messages already received")
-    collect_and_push_to_rabbit(get_sms_messages())
+    collect_and_push_to_rabbit(push_channel, get_sms_messages())
 
     # load_phonebook_from_file()
     # send_sms_message("+447xxxxxxxxx", "Testing 123")
     print("Watching serial for inbound messages")
-    watch_serial_port()
+
+    watch_thread = threading.Thread(target=watch_serial_port, name="Serial Input", args=(push_channel,))
+    watch_thread.start()
+    # watch_serial_port(push_channel)
+
+    print('Initializing RabbitMQ Pull Connection')
+    pull_channel = get_rabbit_connection(
+        user = config.RABBIT_USER,
+        password = config.RABBIT_PASS,
+        server = config.RABBIT_SERVER
+    )
+    pull_channel.queue_declare(queue=config.RABBIT_QUEUE_PREFIX + "inbound_sms")
+
+    queue_thread = threading.Thread(target=queue_handler, name="Queue Worker", args=(pull_channel,))
+    queue_thread.start()
 
 except KeyboardInterrupt:
     print("Quitting...")
